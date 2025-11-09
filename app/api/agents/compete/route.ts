@@ -1,99 +1,128 @@
-import { NextRequest, NextResponse } from "next/server";
-import { StrategyAgent } from "@/lib/agents/strategy-agent";
-import { AGENT_PERSONALITIES } from "@/lib/agents/personalities";
-import { generateMockData } from "@/lib/data/mock-market-data";
+import { NextRequest, NextResponse } from 'next/server';
+import { StrategyAgent, AgentConstraints } from '@/lib/agents/strategy-agent';
+import { AGENT_PERSONALITIES } from '@/lib/agents/personalities';
+import { generateMockData } from '@/lib/data/mock-market-data';
+import { Decision, MarketData, Performance } from '@/lib/types';
 
-const AGENT_DELAY_MS = Number(process.env.ANTHROPIC_DELAY_MS ?? 13000); // ~13s keeps <5 req/min
+type AgentKey = 'The Maximalist' | 'Risk Manager' | 'Gas Optimizer' | 'Yield Hunter';
 
-const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
+interface AgentSnapshot {
+  name: string;
+  emoji: string;
+  color: string;
+  portfolio: number;
+  decision: Decision;
+  currentStrategy: string;
+  currentAPY: number;
+  strategyDetails: {
+    name: string;
+    description: string;
+    riskLevel: string;
+  };
+  performance: Performance;
+}
+
+interface ResultDay {
+  day: number;
+  date: string;
+  marketData: MarketData;
+  agents: AgentSnapshot[];
+}
+
+interface RankingRow {
+  name: string;
+  emoji: string;
+  color: string;
+  currentStrategy: string;
+  currentAPY: number;
+  performance: Performance;
+}
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { days = 10, constraints } = body;
+    const days: number = typeof body.days === 'number' ? body.days : 10;
+    const constraints: Partial<Record<AgentKey, AgentConstraints>> | undefined = body.constraints;
 
-    console.log(`Starting REAL DATA competition for ${days} days...`);
+    console.log(`Starting competition for ${days} days (hybrid engine)…`);
 
-    // build agents (optionally with constraints)
-    const agents = Object.entries(AGENT_PERSONALITIES).map(([key, config]) => {
-      const agentConstraints = constraints?.[key];
-      return new StrategyAgent({ ...config, constraints: agentConstraints });
-    });
+    // Build agents with optional per-agent constraints
+    const agents = (Object.entries(AGENT_PERSONALITIES) as Array<[AgentKey, { name: string; emoji: string; color: string; prompt: string }]>)
+      .map(([key, config]) => {
+        const agentConstraints = constraints?.[key];
+        return new StrategyAgent({
+          ...config,
+          constraints: agentConstraints,
+        });
+      });
 
-    console.log(`Created ${agents.length} agents:`, agents.map(a => a.name));
-    if (constraints) console.log("Using custom constraints:", constraints);
+    console.log(`Created ${agents.length} agents: ${agents.map((a) => a.name).join(', ')}`);
 
     const marketData = generateMockData(days);
-    const results: Array<Record<string, unknown>> = [];
+    const results: ResultDay[] = [];
 
-    for (let day = 0; day < marketData.length; day++) {
-      const dayData = marketData[day];
-      console.log(`Day ${day}: Gas ${dayData.gasPrice} gwei, Sentiment: ${dayData.sentiment}`);
+    for (let i = 0; i < marketData.length; i++) {
+      const dayData = marketData[i];
 
-      // ✅ SEQUENTIAL calls (no Promise.all) + delay between each agent
-      const decisions: Array<{ action?: string; reasoning?: string; risk?: string }> = [];
-      for (let i = 0; i < agents.length; i++) {
-        const agent = agents[i];
-        try {
-          const decision = await agent.makeDecision(dayData);
-          decisions.push(decision);
-        } catch (e) {
-          console.warn(`Agent ${agent.name} decision failed on day ${day}:`, e);
-          decisions.push({ action: "HOLD", reasoning: "API error, holding position" });
-        }
+      console.log(
+        `Day ${dayData.day}: Gas ${dayData.gasPrice} gwei, Sentiment: ${dayData.sentiment}, Trend: ${dayData.trend}`
+      );
 
-        // delay between agent requests to stay under 5 req/min org limit
-        if (i < agents.length - 1) {
-          await sleep(AGENT_DELAY_MS);
-        }
-      }
+      // Hybrid engine is inside StrategyAgent.makeDecision (math + optional Claude under limiter)
+      const decisions: Decision[] = await Promise.all(agents.map((agent) => agent.makeDecision(dayData)));
 
-      results.push({
-        day: dayData.day,
-        date: dayData.date,
-        marketData: dayData,
-        agents: agents.map((agent, idx) => {
-          const currentStrat = agent.getCurrentStrategy();
-          return {
-            name: agent.name,
-            emoji: agent.emoji,
-            color: agent.color,
-            portfolio: agent.portfolio,
-            decision: decisions[idx],
-            currentStrategy: currentStrat.strategy,
-            currentAPY: currentStrat.apy,
-            strategyDetails: {
-              name: currentStrat.strategy,
-              description: currentStrat.description,
-              riskLevel: decisions[idx]?.risk || "MEDIUM",
-            },
-            performance: agent.getPerformance(),
-          };
-        }),
-      });
-    }
-
-    const finalRankings = agents
-      .map((agent) => {
-        const currentStrat = agent.getCurrentStrategy();
+      const snapshots: AgentSnapshot[] = agents.map((agent, idx) => {
+        const strat = agent.getCurrentStrategy();
+        const d = decisions[idx];
         return {
           name: agent.name,
           emoji: agent.emoji,
           color: agent.color,
-          currentStrategy: currentStrat.strategy,
-          currentAPY: currentStrat.apy,
+          portfolio: agent.portfolio,
+          decision: d,
+          currentStrategy: strat.strategy,
+          currentAPY: strat.apy,
+          strategyDetails: {
+            name: strat.strategy,
+            description: strat.description,
+            riskLevel: d.risk ?? 'MEDIUM',
+          },
+          performance: agent.getPerformance(),
+        };
+      });
+
+      results.push({
+        day: dayData.day,
+        date: new Date(dayData.date).toISOString(),
+        marketData: dayData,
+        agents: snapshots,
+      });
+    }
+
+    const rankings: RankingRow[] = agents
+      .map((agent) => {
+        const strat = agent.getCurrentStrategy();
+        return {
+          name: agent.name,
+          emoji: agent.emoji,
+          color: agent.color,
+          currentStrategy: strat.strategy,
+          currentAPY: strat.apy,
           performance: agent.getPerformance(),
         };
       })
       .sort((a, b) => b.performance.totalReturn - a.performance.totalReturn);
 
-    console.log("Competition complete!");
-    return NextResponse.json({ success: true, results, rankings: finalRankings });
+    console.log('Competition complete!');
+
+    return NextResponse.json({
+      success: true,
+      results,
+      rankings,
+    });
   } catch (error) {
-    console.error("Competition error:", error);
-    return NextResponse.json(
-      { success: false, error: error instanceof Error ? error.message : "Competition failed" },
-      { status: 500 }
-    );
+    console.error('Competition error:', error);
+    const message = error instanceof Error ? error.message : 'Competition failed';
+    return NextResponse.json({ success: false, error: message }, { status: 500 });
   }
 }

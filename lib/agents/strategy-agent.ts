@@ -1,19 +1,65 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { MarketData, Decision, Transaction, Performance } from "../types";
-import { findAllStrategies } from "../api/strategy-finder";
+import { findAllStrategies, StrategyOption } from "../api/strategy-finder";
+
+/** ---------- Types ---------- */
+
+export type RiskLevel = "LOW" | "MEDIUM" | "HIGH" | "EXTREME";
 
 export interface AgentConstraints {
   maxLeverage: number;
-  allowedChains: string[];
-  riskTolerance: "LOW" | "MEDIUM" | "HIGH" | "EXTREME";
-  minGasPrice: number;
-  maxGasPrice: number;
-  preferredProtocols: string[];
+  allowedChains: string[]; // lowercase names, e.g. ["ethereum","base"]
+  riskTolerance: RiskLevel;
+  minGasPrice: number; // gwei
+  maxGasPrice: number; // gwei
+  preferredProtocols: string[]; // e.g. ["EtherFi","Aave","Merkl"]
+  displayName?: string;
+  emoji?: string;
+  color?: string;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+/** ---------- Simple in-process token-bucket limiter for Claude ---------- */
+
+class RateLimiter {
+  private capacity: number;
+  private tokens: number;
+  private refillMs: number;
+  private lastRefill: number;
+
+  constructor(capacity: number, refillMs: number) {
+    this.capacity = capacity;
+    this.tokens = capacity;
+    this.refillMs = refillMs;
+    this.lastRefill = Date.now();
+  }
+  private refill() {
+    const now = Date.now();
+    if (now - this.lastRefill >= this.refillMs) {
+      const cycles = Math.floor((now - this.lastRefill) / this.refillMs);
+      this.tokens = Math.min(this.capacity, this.tokens + cycles * this.capacity);
+      this.lastRefill += cycles * this.refillMs;
+    }
+  }
+  take(): boolean {
+    this.refill();
+    if (this.tokens > 0) {
+      this.tokens -= 1;
+      return true;
+    }
+    return false;
+  }
 }
+
+// org limit ~5 req/min
+const globalLimiter = new RateLimiter(5, 60_000);
+
+/** ---------- Scoring constants (tune to taste) ---------- */
+
+const BASE_WEETH_APY = Number(process.env.BASE_WEETH_APY ?? 3.0); // EtherFi base yield
+const GAS_PENALTY_PER_GWEI = Number(process.env.GAS_APY_PENALTY_PER_GWEI ?? 0.02); // APY pts per gwei
+const RISK_PENALTY: Record<RiskLevel, number> = { LOW: 0, MEDIUM: 2, HIGH: 5, EXTREME: 8 };
+
+/** ---------- Agent ---------- */
 
 export class StrategyAgent {
   name: string;
@@ -26,8 +72,16 @@ export class StrategyAgent {
   currentAPY: number;
   constraints?: AgentConstraints;
   private client: Anthropic;
+  private bias: number;
 
-  constructor(config: { name: string; emoji: string; color: string; prompt: string; constraints?: AgentConstraints }) {
+  constructor(config: {
+    name: string;
+    emoji: string;
+    color: string;
+    prompt: string;
+    constraints?: AgentConstraints;
+    decisionMode?: "hybrid" | "numeric" | "ai"; // accepted but "hybrid" is used internally
+  }) {
     this.name = config.name;
     this.emoji = config.emoji;
     this.color = config.color;
@@ -35,199 +89,218 @@ export class StrategyAgent {
     this.portfolio = 10;
     this.transactions = [];
     this.currentStrategy = "Simple weETH Holding";
-    this.currentAPY = 3.0;
+    this.currentAPY = BASE_WEETH_APY;
     this.constraints = config.constraints;
-    this.client = new Anthropic({
-      apiKey: process.env.ANTHROPIC_API_KEY!,
-    });
+
+    // allow UI overrides for identity
+    if (this.constraints?.displayName) this.name = this.constraints.displayName;
+    if (this.constraints?.emoji) this.emoji = this.constraints.emoji;
+    if (this.constraints?.color) this.color = this.constraints.color;
+
+    this.client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+
+    // tiny deterministic tiebreaker so agents don't pick identically when scores tie
+    this.bias = (Array.from(this.name).reduce((a, c) => a + c.charCodeAt(0), 0) % 7) * 0.1; // 0..0.6
   }
 
+  /** Main decision loop: math first, then (if allowed) Claude re-scores top candidates. */
   async makeDecision(marketData: MarketData): Promise<Decision> {
     try {
-      // Constraint check
+      // Hard gas constraint gate
       if (this.constraints) {
         if (
           marketData.gasPrice < this.constraints.minGasPrice ||
           marketData.gasPrice > this.constraints.maxGasPrice
         ) {
-          console.log(`${this.name}: Gas ${marketData.gasPrice} outside range, holding position`);
-          return {
+          const hold: Decision = {
             strategy: this.currentStrategy,
             action: this.currentStrategy,
-            reasoning: `Gas price ${marketData.gasPrice} gwei is outside my allowed range (${this.constraints.minGasPrice}-${this.constraints.maxGasPrice} gwei)`,
+            reasoning: `Holding: gas ${marketData.gasPrice} gwei outside range ${this.constraints.minGasPrice}-${this.constraints.maxGasPrice}.`,
             expectedAPY: this.currentAPY,
+            risk: this.constraints.riskTolerance,
           };
+          this.executeDecision(hold, marketData);
+          return hold;
         }
       }
 
-      const { merklOpportunities, aaveRates, topStrategies } = await findAllStrategies();
+      // Pull live strategy candidates built from Merkl + Aave data
+      const { topStrategies } = await findAllStrategies();
 
       // Filter by constraints
-      let filteredStrategies = topStrategies;
-      if (this.constraints) {
-        filteredStrategies = topStrategies.filter(strat => {
-          const riskLevels = ["LOW", "MEDIUM", "HIGH", "EXTREME"];
-          const stratRiskIndex = riskLevels.indexOf(strat.risk);
-          const maxRiskIndex = riskLevels.indexOf(this.constraints!.riskTolerance);
-          if (stratRiskIndex > maxRiskIndex) return false;
+      const eligible = this.filterByConstraints(topStrategies);
 
-          const hasPreferredProtocol =
-            strat.protocols.some(p => this.constraints!.preferredProtocols.includes(p));
-          if (!hasPreferredProtocol && this.constraints!.preferredProtocols.length > 0) return false;
+      // Score numerically and pick top-N
+      const scored = eligible
+        .map((s) => ({
+          s,
+          score: this.numericScore(s, marketData.gasPrice),
+          adjAPY: this.adjustForGas(s.expectedAPY, marketData.gasPrice),
+        }))
+        .sort((a, b) => b.score - a.score);
 
-          const hasAllowedChain =
-            strat.networks.some(n => this.constraints!.allowedChains.includes(n.toLowerCase()));
-          if (!hasAllowedChain) return false;
+      const top = scored.slice(0, Math.min(5, scored.length));
+      const bestNumeric = top.length ? top[0] : { s: this.fallbackStrategy(), score: -1e9, adjAPY: this.currentAPY };
 
-          return true;
-        });
+      // Try Claude to *reason* over top candidates and choose one
+      let chosen: StrategyOption = bestNumeric.s;
+      let chosenAPY = bestNumeric.adjAPY;
+      let chosenReason = `Selected by numeric score respecting constraints (${this.constraints?.riskTolerance ?? "MEDIUM"} risk).`;
+
+      if (globalLimiter.take()) {
+        try {
+          const claudePick = await this.askClaudeToChoose(top.map(t => t.s), marketData);
+          // Validate Claude's choice against candidates
+          const matched = top.find(t => normalize(t.s.name) === normalize(claudePick.strategyName));
+          if (matched) {
+            chosen = matched.s;
+            chosenAPY = this.adjustForGas(claudePick.expectedAPY ?? matched.s.expectedAPY, marketData.gasPrice);
+            chosenReason = claudePick.reasoning ?? "Chosen by Claude reasoning.";
+          } else if (claudePick.strategyName) {
+            // If Claude named something close, keep numeric choice but keep reasoning
+            chosenReason = claudePick.reasoning ?? chosenReason;
+          }
+        } catch {
+          // ignore rate limits or parsing errors; keep numeric
+        }
       }
 
-      const merklText = merklOpportunities
-        .slice(0, 8)
-        .map(opp => `• ${opp.protocol} on ${opp.network}: ${opp.token} - ${opp.apr.toFixed(2)}% APR`)
-        .join("\n");
-
-      const aaveText = aaveRates
-        .slice(0, 10)
-        .map(rate => `• ${rate.network} - ${rate.symbol}: Supply ${rate.supplyAPY.toFixed(2)}% / Borrow ${rate.borrowAPY.toFixed(2)}%`)
-        .join("\n");
-
-      const strategiesText = filteredStrategies
-        .map(
-          (strat, idx) =>
-            `${idx + 1}. ${strat.name} (${strat.risk}): ${strat.expectedAPY.toFixed(2)}% APY\n   ${strat.description}`,
-        )
-        .join("\n\n");
-
-      const constraintsText = this.constraints
-        ? `
-YOUR CONSTRAINTS:
-- Max Leverage: ${this.constraints.maxLeverage}x
-- Allowed Chains: ${this.constraints.allowedChains.join(", ")}
-- Risk Tolerance: ${this.constraints.riskTolerance}
-- Preferred Protocols: ${this.constraints.preferredProtocols.join(", ")}
-
-You MUST respect these constraints when choosing strategies.
-`
-        : "";
-
-      // --- API call with retry-on-429 logic ---
-      const callClaude = async (): Promise<Decision> => {
-        const message = await this.client.messages.create({
-          model: "claude-sonnet-4-20250514",
-          max_tokens: 900,
-          messages: [
-            {
-              role: "user",
-              content: `${this.personality}
-
-${constraintsText}
-
-CURRENT MARKET DATA (Day ${marketData.day}):
-- Gas Price: ${marketData.gasPrice} gwei
-- Market Sentiment: ${marketData.sentiment}
-- Market Trend: ${marketData.trend}
-
-YOUR PORTFOLIO:
-- Current: ${this.portfolio.toFixed(4)} ETH
-- Current Strategy: ${this.currentStrategy}
-- Current APY: ${this.currentAPY.toFixed(2)}%
-
-REAL DEFI OPPORTUNITIES:
-
-Merkl Incentives:
-${merklText}
-
-Aave Markets:
-${aaveText}
-
-FILTERED STRATEGIES (matching your constraints):
-${strategiesText || "No strategies match your constraints - consider Simple weETH Holding"}
-
-Choose the BEST strategy within your constraints.
-
-RESPOND ONLY WITH VALID JSON (no markdown):
-{
-  "strategyName": "<strategy name>",
-  "expectedAPY": <number>,
-  "reasoning": "2-3 sentences",
-  "protocols": ["list"],
-  "risk": "LOW|MEDIUM|HIGH|EXTREME",
-  "confidence": <1-10>
-}`,
-            },
-          ],
-        });
-
-        const responseText =
-          message.content[0].type === "text" ? message.content[0].text : "{}";
-        const decision = this.parseDecision(responseText);
-        this.executeDecision(decision, marketData);
-        return decision;
+      const decision: Decision = {
+        strategy: chosen.name,
+        action: chosen.name,
+        reasoning: chosenReason,
+        expectedAPY: chosenAPY,
+        protocols: chosen.protocols,
+        risk: chosen.risk,
+        confidence: 8,
       };
 
-      try {
-        return await callClaude();
-      } catch (e) {
-        const err = e as { status?: number; headers?: Headers; message?: string };
-        if (err.status === 429 || /rate_limit/i.test(String(err.message))) {
-          const retryAfter = Number(err.headers?.get?.("retry-after") ?? "60");
-          console.warn(`${this.name}: Rate limited, retrying after ${retryAfter}s...`);
-          await sleep(Math.max(retryAfter * 1000, 16000));
-          return await callClaude();
-        }
-        throw e;
-      }
+      this.executeDecision(decision, marketData);
+      return decision;
     } catch (error) {
       console.error(`Error in ${this.name} decision:`, error);
-      const fallbackDecision: Decision = {
+      const fallback: Decision = {
         strategy: this.currentStrategy,
         action: this.currentStrategy,
         reasoning: "API error, maintaining current position",
-      };
-      this.executeDecision(fallbackDecision, marketData);
-      return fallbackDecision;
-    }
-  }
-
-  private parseDecision(response: string): Decision {
-    try {
-      const cleanResponse = response.trim()
-        .replace(/```json\n?/g, "")
-        .replace(/```\n?/g, "")
-        .trim();
-
-      const jsonMatch = cleanResponse.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        const parsed = JSON.parse(jsonMatch[0]);
-        return {
-          strategy: parsed.strategyName || this.currentStrategy,
-          action: parsed.strategyName || this.currentStrategy,
-          reasoning: parsed.reasoning || "No reasoning provided",
-          expectedAPY: parsed.expectedAPY || this.currentAPY,
-          protocols: parsed.protocols || [],
-          risk: parsed.risk || "MEDIUM",
-          confidence: parsed.confidence || 5,
-        };
-      }
-      throw new Error("No JSON found in response");
-    } catch (e) {
-      console.error(`Failed to parse decision from ${this.name}:`, e);
-      return {
-        strategy: this.currentStrategy,
-        action: this.currentStrategy,
-        reasoning: "Unable to parse decision, maintaining position",
         expectedAPY: this.currentAPY,
       };
+      this.executeDecision(fallback, marketData);
+      return fallback;
     }
   }
 
+  /** ---------- Helper: filter by agent constraints ---------- */
+  private filterByConstraints(strategies: StrategyOption[]): StrategyOption[] {
+    if (!this.constraints) return strategies;
+
+    const riskOrder: RiskLevel[] = ["LOW", "MEDIUM", "HIGH", "EXTREME"];
+    const maxIdx = riskOrder.indexOf(this.constraints.riskTolerance);
+
+    return strategies.filter((s) => {
+      const riskOK = riskOrder.indexOf(s.risk) <= maxIdx;
+
+      const chainsOK =
+        this.constraints!.allowedChains.length === 0 ||
+        s.networks.some((n) => this.constraints!.allowedChains.includes(n.toLowerCase()));
+
+      const protOK =
+        this.constraints!.preferredProtocols.length === 0 ||
+        s.protocols.some((p) => this.constraints!.preferredProtocols.includes(p));
+
+      return riskOK && chainsOK && protOK;
+    });
+  }
+
+  /** ---------- Helper: pure numeric scoring ---------- */
+  private numericScore(s: StrategyOption, gasGwei: number): number {
+    const gasPenalty = gasGwei * GAS_PENALTY_PER_GWEI;
+    const riskPenalty = RISK_PENALTY[s.risk];
+    return s.expectedAPY - gasPenalty - riskPenalty + this.bias;
+  }
+
+  /** ---------- Helper: gas-adjust APY applied to returns ---------- */
+  private adjustForGas(apy: number | undefined, gasGwei: number): number {
+    const base = typeof apy === "number" ? apy : this.currentAPY;
+    const penalty = gasGwei * GAS_PENALTY_PER_GWEI;
+    return Math.max(0, base - penalty);
+  }
+
+  /** ---------- Claude chooser: reasons over top candidates, returns JSON ---------- */
+  private async askClaudeToChoose(candidates: StrategyOption[], marketData: MarketData): Promise<{
+    strategyName: string;
+    expectedAPY?: number;
+    reasoning?: string;
+  }> {
+    // Build compact candidate list for Claude
+    const list = candidates
+      .map(
+        (c, i) =>
+          `${i + 1}. name="${c.name}" apy=${c.expectedAPY.toFixed(2)} risk=${c.risk} protocols=[${c.protocols.join(
+            ","
+          )}] networks=[${c.networks.join(",")}]`
+      )
+      .join("\n");
+
+    const constraintsText = this.constraints
+      ? `Constraints:
+- riskTolerance: ${this.constraints.riskTolerance}
+- allowedChains: ${this.constraints.allowedChains.join(", ") || "any"}
+- preferredProtocols: ${this.constraints.preferredProtocols.join(", ") || "any"}
+- gasRange: ${this.constraints.minGasPrice}-${this.constraints.maxGasPrice} gwei`
+      : "Constraints: none";
+
+    const msg = await this.client.messages.create({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 250,
+      messages: [
+        {
+          role: "user",
+          content:
+            `You are a quantitative DeFi strategist. Choose ONE strategy that maximizes net APY while respecting constraints and gas realities.\n` +
+            `Return STRICT JSON only, no markdown, with fields: strategyName (string), expectedAPY (number), reasoning (string <= 2 sentences).\n\n` +
+            `Market:\n- gas=${marketData.gasPrice} gwei, trend=${marketData.trend}, sentiment=${marketData.sentiment}\n\n` +
+            `${constraintsText}\n\n` +
+            `Candidates:\n${list}\n\n` +
+            `JSON: {"strategyName":"...", "expectedAPY": <number>, "reasoning":"..."}`
+        }
+      ]
+    });
+
+    const text = msg.content[0].type === "text" ? msg.content[0].text.trim() : "{}";
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      return { strategyName: candidates[0]?.name ?? "Simple weETH Holding" };
+    }
+    try {
+      const parsed = JSON.parse(jsonMatch[0]) as { strategyName: string; expectedAPY?: number; reasoning?: string };
+      return parsed.strategyName
+        ? parsed
+        : { strategyName: candidates[0]?.name ?? "Simple weETH Holding" };
+    } catch {
+      return { strategyName: candidates[0]?.name ?? "Simple weETH Holding" };
+    }
+  }
+
+  /** ---------- Fallback when we have zero candidates ---------- */
+  private fallbackStrategy(): StrategyOption {
+    return {
+      name: "Simple weETH Holding",
+      description: "Hold weETH and earn base staking rewards",
+      expectedAPY: BASE_WEETH_APY,
+      protocols: ["EtherFi"],
+      networks: ["ethereum"],
+      risk: "LOW",
+      steps: ["Stake ETH on EtherFi", "Receive weETH", `Earn ~${BASE_WEETH_APY.toFixed(1)}% APY`],
+    };
+  }
+
+  /** ---------- Apply decision to portfolio & record tx ---------- */
   private executeDecision(decision: Decision, marketData: MarketData): void {
     const newStrategy = decision.strategy || this.currentStrategy;
-    const newAPY = decision.expectedAPY || this.currentAPY;
+    const newAPY = typeof decision.expectedAPY === "number" ? decision.expectedAPY : this.currentAPY;
 
-    const transaction: Transaction = {
+    const tx: Transaction = {
       day: marketData.day,
       action: newStrategy,
       reasoning: decision.reasoning || "No reasoning provided",
@@ -236,31 +309,34 @@ RESPOND ONLY WITH VALID JSON (no markdown):
       gasCost: 0,
     };
 
+    // Gas cost if changing strategy
     const isChanging = newStrategy !== this.currentStrategy;
     if (isChanging) {
+      // simple gas cost model (heavier if cross-chain; here we just scale on gwei)
       const gasCost = (marketData.gasPrice / 1000) * 0.003;
       this.portfolio -= gasCost;
-      transaction.gasCost = gasCost;
+      tx.gasCost = gasCost;
     }
 
+    // Daily yield
     const dailyYield = (this.portfolio * newAPY) / 100 / 365;
     this.portfolio += dailyYield;
 
-    transaction.portfolioAfter = this.portfolio;
-    this.transactions.push(transaction);
+    tx.portfolioAfter = this.portfolio;
+    this.transactions.push(tx);
 
+    // Update state
     this.currentStrategy = newStrategy;
     this.currentAPY = newAPY;
   }
+
+  /** ---------- Public getters ---------- */
 
   getPerformance(): Performance {
     const initialValue = 10;
     const currentValue = this.portfolio;
     const totalReturn = ((currentValue - initialValue) / initialValue) * 100;
-    const totalGasCosts = this.transactions.reduce(
-      (sum, tx) => sum + tx.gasCost,
-      0,
-    );
+    const totalGasCosts = this.transactions.reduce((sum, t) => sum + t.gasCost, 0);
 
     return {
       initialValue,
@@ -278,4 +354,9 @@ RESPOND ONLY WITH VALID JSON (no markdown):
       description: this.currentStrategy,
     };
   }
+}
+
+/** ---------- Helpers ---------- */
+function normalize(s: string): string {
+  return s.trim().toLowerCase();
 }

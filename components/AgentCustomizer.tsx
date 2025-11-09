@@ -1,266 +1,323 @@
-"use client";
+'use client';
 
-import { useState } from "react";
-import { Save, RotateCcw } from "lucide-react";
+import React, { useMemo, useState } from 'react';
 
-interface AgentConstraints {
+type RiskLevel = 'LOW' | 'MEDIUM' | 'HIGH' | 'EXTREME';
+type AgentKey = 'The Maximalist' | 'Risk Manager' | 'Gas Optimizer' | 'Yield Hunter';
+
+export interface AgentConstraints {
   maxLeverage: number;
-  allowedChains: string[];
-  riskTolerance: "LOW" | "MEDIUM" | "HIGH" | "EXTREME";
-  minGasPrice: number;
-  maxGasPrice: number;
-  preferredProtocols: string[];
+  allowedChains: string[]; // lowercase: ["ethereum","base","arbitrum"]
+  riskTolerance: RiskLevel;
+  minGasPrice: number; // gwei
+  maxGasPrice: number; // gwei
+  preferredProtocols: string[]; // e.g. ["EtherFi","Aave","Merkl","Morpho"]
+  displayName?: string;
+  emoji?: string;
+  color?: string;
 }
 
-const DEFAULT_CONSTRAINTS: Record<string, AgentConstraints> = {
-  maximalist: {
-    maxLeverage: 10,
-    allowedChains: ["ethereum", "base", "arbitrum"],
-    riskTolerance: "EXTREME",
+type ConstraintsMap = Record<AgentKey, AgentConstraints>;
+
+interface SimulationPerformance {
+  initialValue: number;
+  currentValue: number;
+  totalReturn: number;
+  totalGasCosts: number;
+  transactionCount: number;
+}
+
+interface SimulationRanking {
+  name: string;
+  emoji: string;
+  color: string;
+  currentStrategy: string;
+  currentAPY: number;
+  performance: SimulationPerformance;
+}
+
+interface SimulationResponse {
+  success: boolean;
+  rankings: SimulationRanking[];
+}
+
+const CHAIN_OPTIONS = [
+  { id: 'ethereum', label: 'Ethereum' },
+  { id: 'base', label: 'Base' },
+  { id: 'arbitrum', label: 'Arbitrum' },
+];
+
+const PROTOCOL_OPTIONS = ['EtherFi', 'Aave', 'Merkl', 'Morpho'];
+
+const defaultConstraints: ConstraintsMap = {
+  'The Maximalist': {
+    displayName: 'Agent 1',
+    emoji: '🧠',
+    color: 'slate',
+    maxLeverage: 8,
+    allowedChains: ['ethereum', 'base'],
+    riskTolerance: 'HIGH',
     minGasPrice: 0,
-    maxGasPrice: 100,
-    preferredProtocols: ["Aave", "Merkl", "Compound"],
+    maxGasPrice: 200,
+    preferredProtocols: ['EtherFi', 'Aave', 'Merkl'],
   },
-  riskManager: {
+  'Risk Manager': {
+    displayName: 'Agent 2',
+    emoji: '🛡️',
+    color: 'blue',
     maxLeverage: 2,
-    allowedChains: ["ethereum"],
-    riskTolerance: "LOW",
+    allowedChains: ['ethereum'],
+    riskTolerance: 'LOW',
+    minGasPrice: 0,
+    maxGasPrice: 60,
+    preferredProtocols: ['EtherFi', 'Aave'],
+  },
+  'Gas Optimizer': {
+    displayName: 'Agent 3',
+    emoji: '⚙️',
+    color: 'yellow',
+    maxLeverage: 4,
+    allowedChains: ['base', 'arbitrum'],
+    riskTolerance: 'MEDIUM',
     minGasPrice: 0,
     maxGasPrice: 40,
-    preferredProtocols: ["Aave"],
+    preferredProtocols: ['Aave', 'Merkl'],
   },
-  gasOptimizer: {
+  'Yield Hunter': {
+    displayName: 'Agent 4',
+    emoji: '🎯',
+    color: 'purple',
     maxLeverage: 5,
-    allowedChains: ["base", "arbitrum"],
-    riskTolerance: "MEDIUM",
+    allowedChains: ['base', 'arbitrum'],
+    riskTolerance: 'HIGH',
     minGasPrice: 0,
-    maxGasPrice: 30,
-    preferredProtocols: ["Aave"],
-  },
-  yieldHunter: {
-    maxLeverage: 8,
-    allowedChains: ["ethereum", "base", "arbitrum"],
-    riskTolerance: "HIGH",
-    minGasPrice: 0,
-    maxGasPrice: 100,
-    preferredProtocols: ["Aave", "Merkl", "Morpho"],
+    maxGasPrice: 120,
+    preferredProtocols: ['Merkl', 'Aave', 'EtherFi'],
   },
 };
 
 export default function AgentCustomizer() {
-  const [constraints, setConstraints] = useState(DEFAULT_CONSTRAINTS);
-  const [activeAgent, setActiveAgent] = useState("maximalist");
+  const [days, setDays] = useState<number>(5);
+  const [constraints, setConstraints] = useState<ConstraintsMap>(defaultConstraints);
+  const [loading, setLoading] = useState<boolean>(false);
+  const [result, setResult] = useState<SimulationResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
-  const updateConstraint = (agent: string, field: keyof AgentConstraints, value: number | string | string[]) => {
-    setConstraints({
-      ...constraints,
-      [agent]: {
-        ...constraints[agent],
-        [field]: value,
-      },
-    });
+  const agentOrder: AgentKey[] = useMemo(
+    () => ['The Maximalist', 'Risk Manager', 'Gas Optimizer', 'Yield Hunter'],
+    []
+  );
+
+  const updateConstraint = <K extends keyof AgentConstraints>(
+    key: AgentKey,
+    field: K,
+    value: AgentConstraints[K]
+  ) => {
+    setConstraints((prev) => ({ ...prev, [key]: { ...prev[key], [field]: value } }));
   };
 
-  const toggleChain = (agent: string, chain: string) => {
-    const current = constraints[agent].allowedChains;
-    const updated = current.includes(chain)
-      ? current.filter((c) => c !== chain)
-      : [...current, chain];
-    updateConstraint(agent, "allowedChains", updated);
+  const toggleArrayValue = (arr: string[], value: string): string[] => {
+    return arr.includes(value) ? arr.filter((v) => v !== value) : [...arr, value];
   };
 
-  const resetAgent = (agent: string) => {
-    setConstraints({
-      ...constraints,
-      [agent]: DEFAULT_CONSTRAINTS[agent],
-    });
+  const run = async () => {
+    setLoading(true);
+    setError(null);
+    setResult(null);
+    try {
+      const res = await fetch('/api/agents/compete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ days, constraints }), // hybrid engine only
+      });
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(msg || 'Request failed');
+      }
+      const data: SimulationResponse = await res.json();
+      setResult(data);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Unknown error');
+    } finally {
+      setLoading(false);
+    }
   };
-
-  const saveConstraints = () => {
-    localStorage.setItem("agentConstraints", JSON.stringify(constraints));
-    alert("Agent constraints saved! They'll be used in the next competition.");
-  };
-
-  const agents = [
-    { id: "maximalist", name: "The Maximalist", emoji: "🔥", color: "red" },
-    { id: "riskManager", name: "Risk Manager", emoji: "🛡️", color: "blue" },
-    { id: "gasOptimizer", name: "Gas Optimizer", emoji: "⚡", color: "yellow" },
-    { id: "yieldHunter", name: "Yield Hunter", emoji: "🎯", color: "purple" },
-  ];
-
-  const currentAgent = agents.find((a) => a.id === activeAgent)!;
-  const currentConstraints = constraints[activeAgent];
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 p-8">
-      <div className="max-w-6xl mx-auto">
-        <div className="text-center mb-8">
-          <h2 className="text-5xl font-bold text-white mb-4">⚙️ Customize AI Agents</h2>
-          <p className="text-xl text-slate-300">
-            Set constraints and preferences for each agent&apos;s decision-making
-          </p>
+    <div className="mx-auto max-w-4xl p-4 space-y-6">
+      <h1 className="text-2xl font-bold">EtherFi Strategy Arena</h1>
+
+      {/* Global controls */}
+      <div className="rounded-xl border p-4 space-y-3">
+        <div className="flex items-center gap-3">
+          <label className="w-28 font-medium">Days</label>
+          <input
+            type="number"
+            min={1}
+            max={30}
+            value={days}
+            onChange={(e) => setDays(Number(e.target.value))}
+            className="w-24 rounded border px-2 py-1"
+          />
         </div>
-
-        <div className="grid grid-cols-1 lg:grid-cols-4 gap-4 mb-8">
-          {agents.map((agent) => (
-            <button
-              key={agent.id}
-              onClick={() => setActiveAgent(agent.id)}
-              className={`p-4 rounded-xl font-bold transition-all ${
-                activeAgent === agent.id
-                  ? "bg-purple-600 text-white shadow-lg scale-105"
-                  : "bg-slate-800 text-slate-400 hover:bg-slate-700"
-              }`}
-            >
-              <div className="text-3xl mb-2">{agent.emoji}</div>
-              <div>{agent.name}</div>
-            </button>
-          ))}
-        </div>
-
-        <div className="bg-slate-800/50 backdrop-blur-sm border-2 border-slate-700 rounded-2xl p-8">
-          <div className="flex items-center justify-between mb-6">
-            <h3 className="text-3xl font-bold text-white flex items-center gap-3">
-              <span className="text-4xl">{currentAgent.emoji}</span>
-              {currentAgent.name}
-            </h3>
-            <button
-              onClick={() => resetAgent(activeAgent)}
-              className="flex items-center gap-2 px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-slate-300 transition-all"
-            >
-              <RotateCcw className="w-4 h-4" />
-              Reset
-            </button>
-          </div>
-
-          <div className="space-y-6">
-            {/* Max Leverage */}
-            <div>
-              <label className="text-slate-300 font-semibold mb-2 block">
-                Maximum Leverage: <span className="text-purple-400">{currentConstraints.maxLeverage}x</span>
-              </label>
-              <input
-                type="range"
-                min="1"
-                max="10"
-                value={currentConstraints.maxLeverage}
-                onChange={(e) => updateConstraint(activeAgent, "maxLeverage", Number(e.target.value))}
-                className="w-full"
-              />
-              <div className="flex justify-between text-xs text-slate-500 mt-1">
-                <span>1x</span>
-                <span>5x</span>
-                <span>10x</span>
-              </div>
-            </div>
-
-            {/* Allowed Chains */}
-            <div>
-              <label className="text-slate-300 font-semibold mb-3 block">Allowed Blockchain Networks</label>
-              <div className="grid grid-cols-3 gap-3">
-                {["ethereum", "base", "arbitrum"].map((chain) => (
-                  <button
-                    key={chain}
-                    onClick={() => toggleChain(activeAgent, chain)}
-                    className={`p-3 rounded-lg font-semibold transition-all ${
-                      currentConstraints.allowedChains.includes(chain)
-                        ? "bg-purple-600 text-white"
-                        : "bg-slate-700 text-slate-400"
-                    }`}
-                  >
-                    {chain.charAt(0).toUpperCase() + chain.slice(1)}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Risk Tolerance */}
-            <div>
-              <label className="text-slate-300 font-semibold mb-3 block">Risk Tolerance</label>
-              <div className="grid grid-cols-4 gap-3">
-                {(["LOW", "MEDIUM", "HIGH", "EXTREME"] as const).map((risk) => (
-                  <button
-                    key={risk}
-                    onClick={() => updateConstraint(activeAgent, "riskTolerance", risk)}
-                    className={`p-3 rounded-lg font-semibold transition-all ${
-                      currentConstraints.riskTolerance === risk
-                        ? "bg-purple-600 text-white"
-                        : "bg-slate-700 text-slate-400"
-                    }`}
-                  >
-                    {risk}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Gas Price Range */}
-            <div>
-              <label className="text-slate-300 font-semibold mb-2 block">
-                Gas Price Range: <span className="text-orange-400">{currentConstraints.minGasPrice}-{currentConstraints.maxGasPrice} gwei</span>
-              </label>
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="text-xs text-slate-500">Min Gas</label>
-                  <input
-                    type="number"
-                    value={currentConstraints.minGasPrice}
-                    onChange={(e) => updateConstraint(activeAgent, "minGasPrice", Number(e.target.value))}
-                    className="w-full bg-slate-700 text-white rounded p-2 mt-1"
-                    min="0"
-                    max="100"
-                  />
-                </div>
-                <div>
-                  <label className="text-xs text-slate-500">Max Gas</label>
-                  <input
-                    type="number"
-                    value={currentConstraints.maxGasPrice}
-                    onChange={(e) => updateConstraint(activeAgent, "maxGasPrice", Number(e.target.value))}
-                    className="w-full bg-slate-700 text-white rounded p-2 mt-1"
-                    min="0"
-                    max="100"
-                  />
-                </div>
-              </div>
-            </div>
-
-            {/* Preferred Protocols */}
-            <div>
-              <label className="text-slate-300 font-semibold mb-3 block">Preferred Protocols</label>
-              <div className="flex flex-wrap gap-2">
-                {["Aave", "Merkl", "Compound", "Morpho", "Yearn"].map((protocol) => (
-                  <button
-                    key={protocol}
-                    onClick={() => {
-                      const current = currentConstraints.preferredProtocols;
-                      const updated = current.includes(protocol)
-                        ? current.filter((p) => p !== protocol)
-                        : [...current, protocol];
-                      updateConstraint(activeAgent, "preferredProtocols", updated);
-                    }}
-                    className={`px-4 py-2 rounded-lg font-semibold transition-all ${
-                      currentConstraints.preferredProtocols.includes(protocol)
-                        ? "bg-purple-600 text-white"
-                        : "bg-slate-700 text-slate-400"
-                    }`}
-                  >
-                    {protocol}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-        </div>
-
         <button
-          onClick={saveConstraints}
-          className="w-full mt-8 bg-gradient-to-r from-green-600 to-emerald-600 text-white font-bold py-4 rounded-xl hover:from-green-500 hover:to-emerald-500 transition-all flex items-center justify-center gap-2"
+          onClick={run}
+          disabled={loading}
+          className="rounded-lg bg-black px-4 py-2 text-white disabled:opacity-50"
         >
-          <Save className="w-5 h-5" />
-          Save All Agent Constraints
+          {loading ? 'Running…' : 'Run Simulation'}
         </button>
       </div>
+
+      {/* Agent cards */}
+      <div className="grid gap-4 md:grid-cols-2">
+        {agentOrder.map((key) => {
+          const c = constraints[key];
+          return (
+            <div key={key} className="rounded-xl border p-4 space-y-3">
+              <div className="flex items-center gap-2 text-lg font-semibold">
+                <span>{c.emoji ?? ''}</span>
+                <span>{c.displayName ?? 'Agent'}</span>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <label className="text-sm font-medium">Display name</label>
+                  <input
+                    value={c.displayName ?? ''}
+                    onChange={(e) => updateConstraint(key, 'displayName', e.target.value)}
+                    className="w-full rounded border px-2 py-1"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-sm font-medium">Emoji</label>
+                  <input
+                    value={c.emoji ?? ''}
+                    onChange={(e) => updateConstraint(key, 'emoji', e.target.value)}
+                    className="w-full rounded border px-2 py-1"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-sm font-medium">Color</label>
+                  <input
+                    value={c.color ?? ''}
+                    onChange={(e) => updateConstraint(key, 'color', e.target.value)}
+                    className="w-full rounded border px-2 py-1"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-sm font-medium">Max leverage</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={10}
+                    value={c.maxLeverage}
+                    onChange={(e) => updateConstraint(key, 'maxLeverage', Number(e.target.value))}
+                    className="w-full rounded border px-2 py-1"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-sm font-medium">Risk tolerance</label>
+                  <select
+                    value={c.riskTolerance}
+                    onChange={(e) => updateConstraint(key, 'riskTolerance', e.target.value as RiskLevel)}
+                    className="w-full rounded border px-2 py-1"
+                  >
+                    <option value="LOW">LOW</option>
+                    <option value="MEDIUM">MEDIUM</option>
+                    <option value="HIGH">HIGH</option>
+                    <option value="EXTREME">EXTREME</option>
+                  </select>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-sm font-medium">Min gas (gwei)</label>
+                  <input
+                    type="number"
+                    min={0}
+                    value={c.minGasPrice}
+                    onChange={(e) => updateConstraint(key, 'minGasPrice', Number(e.target.value))}
+                    className="w-full rounded border px-2 py-1"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-sm font-medium">Max gas (gwei)</label>
+                  <input
+                    type="number"
+                    min={0}
+                    value={c.maxGasPrice}
+                    onChange={(e) => updateConstraint(key, 'maxGasPrice', Number(e.target.value))}
+                    className="w-full rounded border px-2 py-1"
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-sm font-medium">Allowed chains</label>
+                <div className="flex flex-wrap gap-3">
+                  {CHAIN_OPTIONS.map((opt) => (
+                    <label key={opt.id} className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={c.allowedChains.includes(opt.id)}
+                        onChange={() =>
+                          updateConstraint(key, 'allowedChains', toggleArrayValue(c.allowedChains, opt.id))
+                        }
+                      />
+                      {opt.label}
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-sm font-medium">Preferred protocols</label>
+                <div className="flex flex-wrap gap-3">
+                  {PROTOCOL_OPTIONS.map((p) => (
+                    <label key={p} className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={c.preferredProtocols.includes(p)}
+                        onChange={() =>
+                          updateConstraint(key, 'preferredProtocols', toggleArrayValue(c.preferredProtocols, p))
+                        }
+                      />
+                      {p}
+                    </label>
+                  ))}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Results */}
+      {error && <div className="rounded-xl border border-red-300 bg-red-50 p-3 text-red-800">{error}</div>}
+      {result && (
+        <div className="rounded-xl border p-4">
+          <h2 className="mb-2 text-lg font-semibold">Final rankings</h2>
+          <div className="space-y-2">
+            {result.rankings.map((r, idx) => (
+              <div key={r.name + idx} className="flex items-center justify-between rounded border p-2">
+                <div className="flex items-center gap-2">
+                  <span>{r.emoji}</span>
+                  <span className="font-medium">{r.name}</span>
+                  <span className="text-sm text-gray-500">({r.currentStrategy})</span>
+                </div>
+                <div className="text-sm">
+                  Return: <span className="font-semibold">{r.performance.totalReturn.toFixed(2)}%</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
