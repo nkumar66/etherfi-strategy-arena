@@ -9,9 +9,12 @@ export interface MarketData {
 }
 
 export interface Decision {
-  action: string;
+  strategy?: string;
+  leverage?: number;
+  action?: string;
   reasoning: string;
-  [key: string]: string | number | undefined; // Allow additional properties from different agents
+  confidence?: number;
+  [key: string]: string | number | undefined;
 }
 
 export interface Transaction {

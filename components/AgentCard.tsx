@@ -1,15 +1,24 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { TrendingUp, TrendingDown, Minus } from "lucide-react";
+import { TrendingUp, TrendingDown, Minus, Zap } from "lucide-react";
 
 interface AgentData {
   name: string;
   emoji: string;
   color: string;
   portfolio: number;
+  currentStrategy?: string;
+  currentLeverage?: number;
+  strategyDetails?: {
+    name: string;
+    description: string;
+    riskLevel: string;
+  };
   decision: {
-    action: string;
+    strategy?: string;
+    leverage?: number;
+    action?: string;
     reasoning: string;
   };
   performance: {
@@ -33,7 +42,17 @@ export default function AgentCard({ agent, rank, isWinner }: AgentCardProps) {
     purple: "from-purple-500/20 to-pink-500/20 border-purple-500/50",
   };
 
+  const riskColors = {
+    LOW: "text-green-400",
+    MEDIUM: "text-yellow-400",
+    HIGH: "text-orange-400",
+    EXTREME: "text-red-400",
+  };
+
   const bgClass = colorClasses[agent.color as keyof typeof colorClasses] || colorClasses.purple;
+  const riskColor = agent.strategyDetails?.riskLevel 
+    ? riskColors[agent.strategyDetails.riskLevel as keyof typeof riskColors]
+    : "text-slate-400";
 
   return (
     <motion.div
@@ -89,13 +108,29 @@ export default function AgentCard({ agent, rank, isWinner }: AgentCardProps) {
           </div>
         </div>
 
-        {/* Latest Decision */}
-        <div className="bg-slate-900/30 rounded-lg p-3">
-          <div className="text-xs text-slate-400 mb-1">Latest Action</div>
-          <div className="text-sm font-semibold text-white mb-1">
-            {agent.decision.action}
+        {/* Current Strategy */}
+        {agent.strategyDetails && (
+          <div className="bg-slate-900/30 rounded-lg p-3">
+            <div className="text-xs text-slate-400 mb-1 flex items-center justify-between">
+              <span>Active Strategy</span>
+              <span className={`font-semibold ${riskColor}`}>
+                {agent.strategyDetails.riskLevel}
+              </span>
+            </div>
+            <div className="text-sm font-semibold text-white mb-1 flex items-center gap-2">
+              <Zap className="w-4 h-4 text-yellow-400" />
+              {agent.currentLeverage}x Leverage
+            </div>
+            <div className="text-xs text-slate-300">
+              {agent.strategyDetails.name}
+            </div>
           </div>
-          <div className="text-xs text-slate-300 line-clamp-2">
+        )}
+
+        {/* Latest Decision Reasoning */}
+        <div className="bg-slate-900/30 rounded-lg p-3">
+          <div className="text-xs text-slate-400 mb-1">Latest Decision</div>
+          <div className="text-xs text-slate-300 line-clamp-3">
             {agent.decision.reasoning}
           </div>
         </div>

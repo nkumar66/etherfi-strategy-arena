@@ -10,8 +10,17 @@ interface AgentData {
   emoji: string;
   color: string;
   portfolio: number;
+  currentStrategy?: string;
+  currentLeverage?: number;
+  strategyDetails?: {
+    name: string;
+    description: string;
+    riskLevel: string;
+  };
   decision: {
-    action: string;
+    strategy?: string;
+    leverage?: number;
+    action?: string;
     reasoning: string;
   };
   performance: {
@@ -25,6 +34,8 @@ interface RankingData {
   name: string;
   emoji: string;
   color: string;
+  currentStrategy: string;
+  currentLeverage: number;
   performance: {
     totalReturn: number;
     totalGasCosts: number;
@@ -32,17 +43,23 @@ interface RankingData {
   };
 }
 
+interface DayResult {
+  day: number;
+  agents: AgentData[];
+}
+
 interface ResultsData {
   agents: AgentData[];
   rankings?: RankingData[];
   showFinal?: boolean;
+  allDays?: DayResult[];
 }
 
 export default function CompetitionView() {
   const [isRunning, setIsRunning] = useState(false);
   const [results, setResults] = useState<ResultsData | null>(null);
   const [currentDay, setCurrentDay] = useState(0);
-  const [days, setDays] = useState(30);
+  const [days, setDays] = useState(10);
 
   const startCompetition = async () => {
     setIsRunning(true);
@@ -68,14 +85,15 @@ export default function CompetitionView() {
       for (let i = 0; i < data.results.length; i++) {
         setCurrentDay(i + 1);
         setResults(data.results[i]);
-        await new Promise((resolve) => setTimeout(resolve, 100)); // 100ms per day
+        await new Promise((resolve) => setTimeout(resolve, 100));
       }
 
-      // Show final results
+      // Show final results with all days for chart
       setResults({
         ...data.results[data.results.length - 1],
         rankings: data.rankings,
         showFinal: true,
+        allDays: data.results,
       });
     } catch (error) {
       console.error("Error running competition:", error);
@@ -85,14 +103,14 @@ export default function CompetitionView() {
     }
   };
 
-  // Prepare chart data
-  const chartData = results?.showFinal
-    ? Array.from({ length: days }, (_, i) => ({
-        day: i,
-        maximalist: 10 + (Math.random() * 0.01), // Simplified - in real app, use actual data
-        riskManager: 10 + (Math.random() * 0.008),
-        gasOptimizer: 10 + (Math.random() * 0.009),
-        contrarian: 10 + (Math.random() * 0.011),
+  // Prepare chart data from actual results
+  const chartData = results?.showFinal && results.allDays
+    ? results.allDays.map((dayResult: DayResult) => ({
+        day: dayResult.day,
+        maximalist: dayResult.agents.find((a: AgentData) => a.name === "The Maximalist")?.portfolio || 10,
+        riskManager: dayResult.agents.find((a: AgentData) => a.name === "Risk Manager")?.portfolio || 10,
+        gasOptimizer: dayResult.agents.find((a: AgentData) => a.name === "Gas Optimizer")?.portfolio || 10,
+        contrarian: dayResult.agents.find((a: AgentData) => a.name === "The Contrarian")?.portfolio || 10,
       }))
     : [];
 
@@ -111,13 +129,13 @@ export default function CompetitionView() {
             EtherFi Strategy Arena
           </h1>
           <p className="text-xl text-slate-300 max-w-2xl mx-auto">
-            Watch AI agents compete to find the best liquid staking strategies using Claude&apos;s
-            multi-agent intelligence
+            Watch AI agents compete using real EtherFi strategies like Aave looping, PYUSD lending, and
+            leverage optimization
           </p>
         </div>
 
         {/* Controls */}
-        <div className="flex justify-center gap-6 mb-12">
+        <div className="flex flex-col sm:flex-row justify-center gap-6 mb-12">
           <div className="flex items-center gap-3">
             <label className="text-slate-300 font-medium">Simulation Days:</label>
             <select
@@ -126,12 +144,13 @@ export default function CompetitionView() {
               disabled={isRunning}
               className="bg-slate-800 border-2 border-slate-700 rounded-lg px-4 py-2 text-white font-mono focus:outline-none focus:border-purple-500"
             >
-              <option value={5}>5 days (Demo)</option>
+              <option value={5}>5 days (Quick Demo)</option>
               <option value={10}>10 days</option>
               <option value={15}>15 days</option>
               <option value={20}>20 days</option>
               <option value={30}>30 days</option>
-              <option value={90}>90 days</option>
+              <option value={60}>60 days</option>
+              <option value={90}>90 days (Full Simulation)</option>
             </select>
           </div>
 
@@ -174,15 +193,22 @@ export default function CompetitionView() {
             </div>
 
             {/* Winner Announcement */}
-            {results.showFinal && results.rankings && (
+            {results.showFinal && results.rankings && results.rankings.length > 0 && (
               <div className="bg-gradient-to-r from-yellow-500/20 to-orange-500/20 border-2 border-yellow-500/50 rounded-2xl p-8 mb-12 text-center">
                 <Trophy className="w-16 h-16 text-yellow-400 mx-auto mb-4" />
                 <h2 className="text-4xl font-bold text-white mb-2">
                   {results.rankings[0].emoji} {results.rankings[0].name} Wins!
                 </h2>
-                <p className="text-xl text-slate-300">
-                  Final Return: <span className="text-green-400 font-bold">
+                <p className="text-xl text-slate-300 mb-2">
+                  Final Return:{" "}
+                  <span className="text-green-400 font-bold">
                     +{results.rankings[0].performance.totalReturn.toFixed(3)}%
+                  </span>
+                </p>
+                <p className="text-lg text-slate-300 mb-2">
+                  Winning Strategy:{" "}
+                  <span className="text-purple-400 font-semibold">
+                    {results.rankings[0].currentStrategy} @ {results.rankings[0].currentLeverage}x
                   </span>
                 </p>
                 <p className="text-sm text-slate-400 mt-2">
@@ -193,7 +219,7 @@ export default function CompetitionView() {
             )}
 
             {/* Chart */}
-            {results.showFinal && (
+            {results.showFinal && chartData.length > 0 && (
               <div className="bg-slate-800/50 backdrop-blur-sm border-2 border-slate-700 rounded-2xl p-6">
                 <h3 className="text-2xl font-bold text-white mb-6">Performance Over Time</h3>
                 <PerformanceChart data={chartData} />
@@ -206,30 +232,36 @@ export default function CompetitionView() {
         {!results && !isRunning && (
           <div className="mt-16 text-center text-slate-400 space-y-4">
             <p className="text-lg">
-              Four AI agents with different investment philosophies compete on historical EtherFi
-              data
+              Four AI agents with different strategies compete using real EtherFi protocols
             </p>
-            <div className="flex justify-center gap-8 text-sm">
-              <div>
-                <span className="text-2xl">🔥</span>
-                <p>Maximalist</p>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-6 max-w-4xl mx-auto mt-8">
+              <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700">
+                <div className="text-3xl mb-2">🔥</div>
+                <h4 className="font-bold text-white mb-1">Maximalist</h4>
+                <p className="text-xs text-slate-400">10x Aave loops</p>
                 <p className="text-xs text-slate-500">High risk, high reward</p>
               </div>
-              <div>
-                <span className="text-2xl">🛡️</span>
-                <p>Risk Manager</p>
-                <p className="text-xs text-slate-500">Safety first</p>
+              <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700">
+                <div className="text-3xl mb-2">🛡️</div>
+                <h4 className="font-bold text-white mb-1">Risk Manager</h4>
+                <p className="text-xs text-slate-400">2-3x leverage max</p>
+                <p className="text-xs text-slate-500">Safety first approach</p>
               </div>
-              <div>
-                <span className="text-2xl">⚡</span>
-                <p>Gas Optimizer</p>
-                <p className="text-xs text-slate-500">Minimize costs</p>
+              <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700">
+                <div className="text-3xl mb-2">⚡</div>
+                <h4 className="font-bold text-white mb-1">Gas Optimizer</h4>
+                <p className="text-xs text-slate-400">Waits for cheap gas</p>
+                <p className="text-xs text-slate-500">Efficiency focused</p>
               </div>
-              <div>
-                <span className="text-2xl">🎲</span>
-                <p>Contrarian</p>
-                <p className="text-xs text-slate-500">Fade the crowd</p>
+              <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700">
+                <div className="text-3xl mb-2">🎲</div>
+                <h4 className="font-bold text-white mb-1">Contrarian</h4>
+                <p className="text-xs text-slate-400">Fades the crowd</p>
+                <p className="text-xs text-slate-500">Buy fear, sell greed</p>
               </div>
+            </div>
+            <div className="mt-8 text-sm text-slate-500">
+              <p>Strategies include: Aave ETH Looping, PYUSD Lending, RLUSD Strategies & More</p>
             </div>
           </div>
         )}
