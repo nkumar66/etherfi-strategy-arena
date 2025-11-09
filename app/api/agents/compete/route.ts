@@ -3,44 +3,51 @@ import { StrategyAgent } from "@/lib/agents/strategy-agent";
 import { AGENT_PERSONALITIES } from "@/lib/agents/personalities";
 import { generateMockData } from "@/lib/data/mock-market-data";
 
+const AGENT_DELAY_MS = Number(process.env.ANTHROPIC_DELAY_MS ?? 13000); // ~13s keeps <5 req/min
+
+const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { days = 30 } = body;
+    const { days = 10, constraints } = body;
 
-    console.log(`Starting competition for ${days} days...`);
+    console.log(`Starting REAL DATA competition for ${days} days...`);
 
-    // Create 4 agents with their personalities
-    const agents = Object.values(AGENT_PERSONALITIES).map(
-      (config) => new StrategyAgent(config)
-    );
+    // build agents (optionally with constraints)
+    const agents = Object.entries(AGENT_PERSONALITIES).map(([key, config]) => {
+      const agentConstraints = constraints?.[key];
+      return new StrategyAgent({ ...config, constraints: agentConstraints });
+    });
 
     console.log(`Created ${agents.length} agents:`, agents.map(a => a.name));
+    if (constraints) console.log("Using custom constraints:", constraints);
 
-    // Generate market data
     const marketData = generateMockData(days);
-    console.log(`Generated ${marketData.length} days of market data`);
+    const results: Array<Record<string, unknown>> = [];
 
-    // Results array to store each day's state
-    const results = [];
-
-    // Run competition day by day
     for (let day = 0; day < marketData.length; day++) {
       const dayData = marketData[day];
+      console.log(`Day ${day}: Gas ${dayData.gasPrice} gwei, Sentiment: ${dayData.sentiment}`);
 
-      // Add delay every day to avoid rate limits (15 seconds)
-      if (day > 0) {
-        await new Promise(resolve => setTimeout(resolve, 15000));
+      // ✅ SEQUENTIAL calls (no Promise.all) + delay between each agent
+      const decisions: Array<{ action?: string; reasoning?: string; risk?: string }> = [];
+      for (let i = 0; i < agents.length; i++) {
+        const agent = agents[i];
+        try {
+          const decision = await agent.makeDecision(dayData);
+          decisions.push(decision);
+        } catch (e) {
+          console.warn(`Agent ${agent.name} decision failed on day ${day}:`, e);
+          decisions.push({ action: "HOLD", reasoning: "API error, holding position" });
+        }
+
+        // delay between agent requests to stay under 5 req/min org limit
+        if (i < agents.length - 1) {
+          await sleep(AGENT_DELAY_MS);
+        }
       }
 
-      console.log(`Day ${day}: APY ${dayData.apy}%, Gas ${dayData.gasPrice} gwei`);
-
-      // Each agent makes a decision (in parallel for speed)
-      const decisions = await Promise.all(
-        agents.map((agent) => agent.makeDecision(dayData))
-      );
-
-      // Collect current state for this day
       results.push({
         day: dayData.day,
         date: dayData.date,
@@ -54,15 +61,18 @@ export async function POST(req: NextRequest) {
             portfolio: agent.portfolio,
             decision: decisions[idx],
             currentStrategy: currentStrat.strategy,
-            currentLeverage: currentStrat.leverage,
-            strategyDetails: currentStrat.details,
+            currentAPY: currentStrat.apy,
+            strategyDetails: {
+              name: currentStrat.strategy,
+              description: currentStrat.description,
+              riskLevel: decisions[idx]?.risk || "MEDIUM",
+            },
             performance: agent.getPerformance(),
           };
         }),
       });
     }
 
-    // Calculate final rankings
     const finalRankings = agents
       .map((agent) => {
         const currentStrat = agent.getCurrentStrategy();
@@ -71,32 +81,18 @@ export async function POST(req: NextRequest) {
           emoji: agent.emoji,
           color: agent.color,
           currentStrategy: currentStrat.strategy,
-          currentLeverage: currentStrat.leverage,
+          currentAPY: currentStrat.apy,
           performance: agent.getPerformance(),
         };
       })
       .sort((a, b) => b.performance.totalReturn - a.performance.totalReturn);
 
-    console.log("Competition complete! Final rankings:");
-    finalRankings.forEach((agent, idx) => {
-      console.log(
-        `${idx + 1}. ${agent.emoji} ${agent.name}: ${agent.performance.totalReturn.toFixed(3)}% ` +
-        `(Strategy: ${agent.currentStrategy} @ ${agent.currentLeverage}x)`
-      );
-    });
-
-    return NextResponse.json({
-      success: true,
-      results,
-      rankings: finalRankings,
-    });
+    console.log("Competition complete!");
+    return NextResponse.json({ success: true, results, rankings: finalRankings });
   } catch (error) {
     console.error("Competition error:", error);
     return NextResponse.json(
-      {
-        success: false,
-        error: error instanceof Error ? error.message : "Competition failed",
-      },
+      { success: false, error: error instanceof Error ? error.message : "Competition failed" },
       { status: 500 }
     );
   }

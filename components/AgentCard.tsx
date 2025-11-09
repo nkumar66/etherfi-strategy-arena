@@ -121,7 +121,7 @@ export default function AgentCard({ agent, rank, isWinner }: AgentCardProps) {
               <Zap className="w-4 h-4 text-yellow-400" />
               {agent.currentLeverage}x Leverage
             </div>
-            <div className="text-xs text-slate-300">
+            <div className="text-xs text-slate-300 line-clamp-2">
               {agent.strategyDetails.name}
             </div>
           </div>
@@ -136,7 +136,7 @@ export default function AgentCard({ agent, rank, isWinner }: AgentCardProps) {
         </div>
 
         {/* Gas Costs */}
-        <div className="flex justify-between text-xs text-slate-400">
+        <div className="flex justify-between text-xs -slate-400">
           <span>Total Gas Spent:</span>
           <span className="text-orange-400 font-mono">
             Ξ {agent.performance.totalGasCosts.toFixed(6)}

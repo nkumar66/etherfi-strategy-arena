@@ -10,11 +10,13 @@ export interface MarketData {
 
 export interface Decision {
   strategy?: string;
-  leverage?: number;
   action?: string;
   reasoning: string;
+  expectedAPY?: number;
+  protocols?: string[];
+  risk?: string;
   confidence?: number;
-  [key: string]: string | number | undefined;
+  [key: string]: string | number | string[] | undefined;
 }
 
 export interface Transaction {

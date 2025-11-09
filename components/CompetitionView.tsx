@@ -62,46 +62,51 @@ export default function CompetitionView() {
   const [days, setDays] = useState(10);
 
   const startCompetition = async () => {
-    setIsRunning(true);
-    setResults(null);
-    setCurrentDay(0);
+  setIsRunning(true);
+  setResults(null);
+  setCurrentDay(0);
 
-    try {
-      const response = await fetch("/api/agents/compete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ days }),
-      });
+  try {
+    // Load constraints from localStorage
+    const savedConstraints = localStorage.getItem("agentConstraints");
+    const constraints = savedConstraints ? JSON.parse(savedConstraints) : null;
 
-      const data = await response.json();
+    const response = await fetch("/api/agents/compete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ 
+        days,
+        constraints // NEW: send constraints
+      }),
+    });
 
-      if (!data.success) {
-        alert("Competition failed: " + data.error);
-        setIsRunning(false);
-        return;
-      }
+    const data = await response.json();
 
-      // Animate through results day by day
-      for (let i = 0; i < data.results.length; i++) {
-        setCurrentDay(i + 1);
-        setResults(data.results[i]);
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
-
-      // Show final results with all days for chart
-      setResults({
-        ...data.results[data.results.length - 1],
-        rankings: data.rankings,
-        showFinal: true,
-        allDays: data.results,
-      });
-    } catch (error) {
-      console.error("Error running competition:", error);
-      alert("Competition failed. Check console for details.");
-    } finally {
+    if (!data.success) {
+      alert("Competition failed: " + data.error);
       setIsRunning(false);
+      return;
     }
-  };
+
+    for (let i = 0; i < data.results.length; i++) {
+      setCurrentDay(i + 1);
+      setResults(data.results[i]);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+
+    setResults({
+      ...data.results[data.results.length - 1],
+      rankings: data.rankings,
+      showFinal: true,
+      allDays: data.results,
+    });
+  } catch (error) {
+    console.error("Error running competition:", error);
+    alert("Competition failed. Check console for details.");
+  } finally {
+    setIsRunning(false);
+  }
+};
 
   // Prepare chart data from actual results
   const chartData = results?.showFinal && results.allDays
