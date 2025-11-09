@@ -1,16 +1,15 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { StrategyAgent, AgentConstraints } from '@/lib/agents/strategy-agent';
-import { AGENT_PERSONALITIES } from '@/lib/agents/personalities';
-import { generateMockData } from '@/lib/data/mock-market-data';
-import { Decision, MarketData, Performance } from '@/lib/types';
+// app/api/agents/compete/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import { StrategyAgent, AgentConstraints } from "@/lib/agents/strategy-agent";
+import { AGENT_PERSONALITIES } from "@/lib/agents/personalities";
+import { generateMockData } from "@/lib/data/mock-market-data";
+import { Decision, MarketData, Performance } from "@/lib/types";
 
-type AgentKey = 'The Maximalist' | 'Risk Manager' | 'Gas Optimizer' | 'Yield Hunter';
+type AgentKey = "The Maximalist" | "Risk Manager" | "Gas Optimizer" | "Yield Hunter";
 
 interface AgentSnapshot {
-  name: string;
-  emoji: string;
-  color: string;
-  portfolio: number;
+  name: string;            // "Agent 1/2/3/4" (not the old labels)
+  portfolio: number;       // simple simulated value
   decision: Decision;
   currentStrategy: string;
   currentAPY: number;
@@ -31,89 +30,117 @@ interface ResultDay {
 
 interface RankingRow {
   name: string;
-  emoji: string;
-  color: string;
   currentStrategy: string;
   currentAPY: number;
   performance: Performance;
 }
 
+// Defaults merged with per-agent constraints coming from the UI
+const DEFAULT_CONSTRAINTS: AgentConstraints = {
+  maxLeverage: 3,
+  allowedChains: ["ethereum", "base", "arbitrum"],
+  riskTolerance: "MEDIUM",
+  minGasPrice: 0,
+  maxGasPrice: 200,
+  preferredProtocols: ["etherfi", "aave", "morpho", "merkl"],
+  preferEfficiency: true,
+  preferStability: true,
+  preferContrarian: false,
+};
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const days: number = typeof body.days === 'number' ? body.days : 10;
+    const days: number = typeof body.days === "number" ? body.days : 10;
+
+    // constraints is shaped like { [AgentKey]: AgentConstraintsLike }
     const constraints: Partial<Record<AgentKey, AgentConstraints>> | undefined = body.constraints;
 
-    console.log(`Starting competition for ${days} days (hybrid engine)…`);
-
-    // Build agents with optional per-agent constraints
-    const agents = (Object.entries(AGENT_PERSONALITIES) as Array<[AgentKey, { name: string; emoji: string; color: string; prompt: string }]>)
-      .map(([key, config]) => {
-        const agentConstraints = constraints?.[key];
-        return new StrategyAgent({
-          ...config,
-          constraints: agentConstraints,
-        });
-      });
-
-    console.log(`Created ${agents.length} agents: ${agents.map((a) => a.name).join(', ')}`);
+    // Build agents using displayName (or "Agent i") and ignore emoji/color
+    const agents = (Object.entries(AGENT_PERSONALITIES) as Array<
+      [AgentKey, { name: string; emoji: string; color: string; prompt: string }]
+    >).map(([key, _meta], idx) => {
+      const mergedConstraints: AgentConstraints = {
+        ...DEFAULT_CONSTRAINTS,
+        ...(constraints?.[key] ?? {}),
+      };
+      const display = mergedConstraints.displayName || `Agent ${idx + 1}`;
+      return {
+        name: display,
+        agent: new StrategyAgent({ id: display, constraints: mergedConstraints }),
+        perf: <Performance>{
+          initialValue: 1000,
+          currentValue: 1000,
+          totalReturn: 0,
+          totalGasCosts: 0,
+          transactionCount: 0,
+        },
+      };
+    });
 
     const marketData = generateMockData(days);
     const results: ResultDay[] = [];
 
+    // Simulate day-by-day decisions and a tiny PnL update so returns are not all 0.00%
     for (let i = 0; i < marketData.length; i++) {
-      const dayData = marketData[i];
+      const dayData: MarketData = marketData[i];
 
-      console.log(
-        `Day ${dayData.day}: Gas ${dayData.gasPrice} gwei, Sentiment: ${dayData.sentiment}, Trend: ${dayData.trend}`
-      );
+      const decisions: Decision[] = await Promise.all(agents.map(({ agent }) => agent.decide(dayData)));
 
-      // Hybrid engine is inside StrategyAgent.makeDecision (math + optional Claude under limiter)
-      const decisions: Decision[] = await Promise.all(agents.map((agent) => agent.makeDecision(dayData)));
+      // naive daily compounding from expectedAPY
+      decisions.forEach((d, idx) => {
+        const perf = agents[idx].perf;
+        const apy = (d.expectedAPY ?? 0) / 100;
+        const daily = apy / 365;
+        perf.currentValue = perf.currentValue * (1 + daily);
+        perf.totalReturn = ((perf.currentValue - perf.initialValue) / perf.initialValue) * 100;
+        perf.transactionCount += d.action !== "HOLD" ? 1 : 0;
+      });
 
-      const snapshots: AgentSnapshot[] = agents.map((agent, idx) => {
+      const snapshots: AgentSnapshot[] = agents.map(({ name, agent, perf }, idx) => {
         const strat = agent.getCurrentStrategy();
         const d = decisions[idx];
         return {
-          name: agent.name,
-          emoji: agent.emoji,
-          color: agent.color,
-          portfolio: agent.portfolio,
+          name,
+          portfolio: perf.currentValue,
           decision: d,
           currentStrategy: strat.strategy,
           currentAPY: strat.apy,
           strategyDetails: {
             name: strat.strategy,
             description: strat.description,
-            riskLevel: d.risk ?? 'MEDIUM',
+            riskLevel: "MEDIUM", // store/compute from chosen strategy if you want
           },
-          performance: agent.getPerformance(),
+          performance: perf,
         };
       });
 
+      const dateIso =
+        typeof dayData.date === "string"
+          ? new Date(dayData.date).toISOString()
+          : dayData.date instanceof Date
+          ? dayData.date.toISOString()
+          : new Date().toISOString();
+
       results.push({
         day: dayData.day,
-        date: new Date(dayData.date).toISOString(),
+        date: dateIso,
         marketData: dayData,
         agents: snapshots,
       });
     }
 
     const rankings: RankingRow[] = agents
-      .map((agent) => {
+      .map(({ name, agent, perf }) => {
         const strat = agent.getCurrentStrategy();
         return {
-          name: agent.name,
-          emoji: agent.emoji,
-          color: agent.color,
+          name,
           currentStrategy: strat.strategy,
           currentAPY: strat.apy,
-          performance: agent.getPerformance(),
+          performance: perf,
         };
       })
       .sort((a, b) => b.performance.totalReturn - a.performance.totalReturn);
-
-    console.log('Competition complete!');
 
     return NextResponse.json({
       success: true,
@@ -121,8 +148,8 @@ export async function POST(req: NextRequest) {
       rankings,
     });
   } catch (error) {
-    console.error('Competition error:', error);
-    const message = error instanceof Error ? error.message : 'Competition failed';
+    console.error("Competition error:", error);
+    const message = error instanceof Error ? error.message : "Competition failed";
     return NextResponse.json({ success: false, error: message }, { status: 500 });
   }
 }

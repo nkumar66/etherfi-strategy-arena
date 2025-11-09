@@ -1,321 +1,252 @@
-'use client';
+// components/AgentCustomizer.tsx
+"use client";
 
-import React, { useMemo, useState } from 'react';
+import { useState } from "react";
 
-type RiskLevel = 'LOW' | 'MEDIUM' | 'HIGH' | 'EXTREME';
-type AgentKey = 'The Maximalist' | 'Risk Manager' | 'Gas Optimizer' | 'Yield Hunter';
+type Risk = "LOW" | "MEDIUM" | "HIGH" | "EXTREME";
 
-export interface AgentConstraints {
+type AgentConstraintsForm = {
+  displayName: string;
   maxLeverage: number;
-  allowedChains: string[]; // lowercase: ["ethereum","base","arbitrum"]
-  riskTolerance: RiskLevel;
-  minGasPrice: number; // gwei
-  maxGasPrice: number; // gwei
-  preferredProtocols: string[]; // e.g. ["EtherFi","Aave","Merkl","Morpho"]
-  displayName?: string;
-  emoji?: string;
-  color?: string;
-}
-
-type ConstraintsMap = Record<AgentKey, AgentConstraints>;
-
-interface SimulationPerformance {
-  initialValue: number;
-  currentValue: number;
-  totalReturn: number;
-  totalGasCosts: number;
-  transactionCount: number;
-}
-
-interface SimulationRanking {
-  name: string;
-  emoji: string;
-  color: string;
-  currentStrategy: string;
-  currentAPY: number;
-  performance: SimulationPerformance;
-}
-
-interface SimulationResponse {
-  success: boolean;
-  rankings: SimulationRanking[];
-}
-
-const CHAIN_OPTIONS = [
-  { id: 'ethereum', label: 'Ethereum' },
-  { id: 'base', label: 'Base' },
-  { id: 'arbitrum', label: 'Arbitrum' },
-];
-
-const PROTOCOL_OPTIONS = ['EtherFi', 'Aave', 'Merkl', 'Morpho'];
-
-const defaultConstraints: ConstraintsMap = {
-  'The Maximalist': {
-    displayName: 'Agent 1',
-    emoji: '🧠',
-    color: 'slate',
-    maxLeverage: 8,
-    allowedChains: ['ethereum', 'base'],
-    riskTolerance: 'HIGH',
-    minGasPrice: 0,
-    maxGasPrice: 200,
-    preferredProtocols: ['EtherFi', 'Aave', 'Merkl'],
-  },
-  'Risk Manager': {
-    displayName: 'Agent 2',
-    emoji: '🛡️',
-    color: 'blue',
-    maxLeverage: 2,
-    allowedChains: ['ethereum'],
-    riskTolerance: 'LOW',
-    minGasPrice: 0,
-    maxGasPrice: 60,
-    preferredProtocols: ['EtherFi', 'Aave'],
-  },
-  'Gas Optimizer': {
-    displayName: 'Agent 3',
-    emoji: '⚙️',
-    color: 'yellow',
-    maxLeverage: 4,
-    allowedChains: ['base', 'arbitrum'],
-    riskTolerance: 'MEDIUM',
-    minGasPrice: 0,
-    maxGasPrice: 40,
-    preferredProtocols: ['Aave', 'Merkl'],
-  },
-  'Yield Hunter': {
-    displayName: 'Agent 4',
-    emoji: '🎯',
-    color: 'purple',
-    maxLeverage: 5,
-    allowedChains: ['base', 'arbitrum'],
-    riskTolerance: 'HIGH',
-    minGasPrice: 0,
-    maxGasPrice: 120,
-    preferredProtocols: ['Merkl', 'Aave', 'EtherFi'],
-  },
+  minGasPrice: number;
+  maxGasPrice: number;
+  riskTolerance: Risk;
+  allowedChains: { ethereum: boolean; base: boolean; arbitrum: boolean };
+  preferredProtocols: { etherfi: boolean; aave: boolean; morpho: boolean; merkl: boolean };
 };
+
+const defaultAgent = (idx: number): AgentConstraintsForm => ({
+  displayName: `Agent ${idx + 1}`,
+  maxLeverage: 3,
+  minGasPrice: 0,
+  maxGasPrice: 200,
+  riskTolerance: "MEDIUM",
+  allowedChains: { ethereum: true, base: true, arbitrum: false },
+  preferredProtocols: { etherfi: true, aave: true, morpho: true, merkl: true },
+});
 
 export default function AgentCustomizer() {
   const [days, setDays] = useState<number>(5);
-  const [constraints, setConstraints] = useState<ConstraintsMap>(defaultConstraints);
-  const [loading, setLoading] = useState<boolean>(false);
-  const [result, setResult] = useState<SimulationResponse | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  const agentOrder: AgentKey[] = useMemo(
-    () => ['The Maximalist', 'Risk Manager', 'Gas Optimizer', 'Yield Hunter'],
-    []
+  const [agents, setAgents] = useState<AgentConstraintsForm[]>(
+    Array.from({ length: 4 }, (_, i) => defaultAgent(i))
   );
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState<
+  { success: boolean; rankings?: { name: string; currentStrategy: string; currentAPY: number; performance: { totalReturn: number } }[] } | null
+>(null);
 
-  const updateConstraint = <K extends keyof AgentConstraints>(
-    key: AgentKey,
-    field: K,
-    value: AgentConstraints[K]
+  const updateAgent = <K extends keyof AgentConstraintsForm>(
+    i: number,
+    key: K,
+    value: AgentConstraintsForm[K]
   ) => {
-    setConstraints((prev) => ({ ...prev, [key]: { ...prev[key], [field]: value } }));
+    setAgents((prev) => {
+      const next = [...prev];
+      next[i] = { ...next[i], [key]: value } as AgentConstraintsForm;
+      return next;
+    });
   };
 
-  const toggleArrayValue = (arr: string[], value: string): string[] => {
-    return arr.includes(value) ? arr.filter((v) => v !== value) : [...arr, value];
+  const toggleNested = (
+    i: number,
+    group: "allowedChains" | "preferredProtocols",
+    key: string
+  ) => {
+    setAgents((prev) => {
+      const next = [...prev];
+      const cur = next[i][group] as Record<string, boolean>;
+      next[i] = { ...next[i], [group]: { ...cur, [key]: !cur[key] } } as AgentConstraintsForm;
+      return next;
+    });
   };
 
-  const run = async () => {
+  async function runSimulation() {
     setLoading(true);
-    setError(null);
     setResult(null);
     try {
-      const res = await fetch('/api/agents/compete', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ days, constraints }), // hybrid engine only
+      // Map our UI to the API payload keyed by original personality keys
+      const toApi = (a: AgentConstraintsForm) => ({
+        displayName: a.displayName,
+        maxLeverage: a.maxLeverage,
+        minGasPrice: a.minGasPrice,
+        maxGasPrice: a.maxGasPrice,
+        riskTolerance: a.riskTolerance,
+        allowedChains: [
+          a.allowedChains.ethereum && "ethereum",
+          a.allowedChains.base && "base",
+          a.allowedChains.arbitrum && "arbitrum",
+        ].filter(Boolean) as string[],
+        preferredProtocols: [
+          a.preferredProtocols.etherfi && "etherfi",
+          a.preferredProtocols.aave && "aave",
+          a.preferredProtocols.morpho && "morpho",
+          a.preferredProtocols.merkl && "merkl",
+        ].filter(Boolean) as string[],
       });
-      if (!res.ok) {
-        const msg = await res.text();
-        throw new Error(msg || 'Request failed');
-      }
-      const data: SimulationResponse = await res.json();
-      setResult(data);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Unknown error');
+
+      // Keep the old keys so the server can merge, but send our constraints
+      const payload = {
+        days,
+        constraints: {
+          "The Maximalist": toApi(agents[0]),
+          "Risk Manager": toApi(agents[1]),
+          "Gas Optimizer": toApi(agents[2]),
+          "Yield Hunter": toApi(agents[3]),
+        },
+      };
+
+      const res = await fetch("/api/agents/compete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const json = await res.json();
+      setResult(json);
     } finally {
       setLoading(false);
     }
-  };
+  }
 
   return (
-    <div className="mx-auto max-w-4xl p-4 space-y-6">
-      <h1 className="text-2xl font-bold">EtherFi Strategy Arena</h1>
+    <div className="max-w-5xl mx-auto px-4 py-6">
+      <h1 className="text-3xl font-semibold tracking-tight mb-6">EtherFi Strategy Arena</h1>
 
-      {/* Global controls */}
-      <div className="rounded-xl border p-4 space-y-3">
-        <div className="flex items-center gap-3">
-          <label className="w-28 font-medium">Days</label>
-          <input
-            type="number"
-            min={1}
-            max={30}
-            value={days}
-            onChange={(e) => setDays(Number(e.target.value))}
-            className="w-24 rounded border px-2 py-1"
-          />
-        </div>
+      {/* Controls */}
+      <div className="rounded-2xl border p-5 shadow-sm mb-6">
+        <label className="block text-sm font-medium mb-2">Days</label>
+        <input
+          type="number"
+          value={days}
+          onChange={(e) => setDays(parseInt(e.target.value || "0", 10))}
+          className="border rounded-lg px-3 py-2 w-32"
+          min={1}
+        />
         <button
-          onClick={run}
+          onClick={runSimulation}
           disabled={loading}
-          className="rounded-lg bg-black px-4 py-2 text-white disabled:opacity-50"
+          className="ml-4 px-4 py-2 rounded-xl bg-black text-white font-medium hover:opacity-90 disabled:opacity-60"
         >
-          {loading ? 'Running…' : 'Run Simulation'}
+          {loading ? "Running…" : "Run Simulation"}
         </button>
       </div>
 
-      {/* Agent cards */}
-      <div className="grid gap-4 md:grid-cols-2">
-        {agentOrder.map((key) => {
-          const c = constraints[key];
-          return (
-            <div key={key} className="rounded-xl border p-4 space-y-3">
-              <div className="flex items-center gap-2 text-lg font-semibold">
-                <span>{c.emoji ?? ''}</span>
-                <span>{c.displayName ?? 'Agent'}</span>
+      {/* Agents */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        {agents.map((a, i) => (
+          <div key={i} className="rounded-2xl border p-5 shadow-sm">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="text-xl font-semibold">Agent {i + 1}</div>
+            </div>
+
+            <label className="block text-sm font-medium">Display name</label>
+            <input
+              className="border rounded-lg px-3 py-2 w-full mb-3"
+              value={a.displayName}
+              onChange={(e) => updateAgent(i, "displayName", e.target.value)}
+            />
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-sm font-medium">Max leverage</label>
+                <input
+                  type="number"
+                  className="border rounded-lg px-3 py-2 w-full"
+                  value={a.maxLeverage}
+                  onChange={(e) => updateAgent(i, "maxLeverage", parseFloat(e.target.value || "0"))}
+                />
               </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div className="space-y-1">
-                  <label className="text-sm font-medium">Display name</label>
-                  <input
-                    value={c.displayName ?? ''}
-                    onChange={(e) => updateConstraint(key, 'displayName', e.target.value)}
-                    className="w-full rounded border px-2 py-1"
-                  />
-                </div>
-
-                <div className="space-y-1">
-                  <label className="text-sm font-medium">Emoji</label>
-                  <input
-                    value={c.emoji ?? ''}
-                    onChange={(e) => updateConstraint(key, 'emoji', e.target.value)}
-                    className="w-full rounded border px-2 py-1"
-                  />
-                </div>
-
-                <div className="space-y-1">
-                  <label className="text-sm font-medium">Color</label>
-                  <input
-                    value={c.color ?? ''}
-                    onChange={(e) => updateConstraint(key, 'color', e.target.value)}
-                    className="w-full rounded border px-2 py-1"
-                  />
-                </div>
-
-                <div className="space-y-1">
-                  <label className="text-sm font-medium">Max leverage</label>
-                  <input
-                    type="number"
-                    min={1}
-                    max={10}
-                    value={c.maxLeverage}
-                    onChange={(e) => updateConstraint(key, 'maxLeverage', Number(e.target.value))}
-                    className="w-full rounded border px-2 py-1"
-                  />
-                </div>
-
-                <div className="space-y-1">
-                  <label className="text-sm font-medium">Risk tolerance</label>
-                  <select
-                    value={c.riskTolerance}
-                    onChange={(e) => updateConstraint(key, 'riskTolerance', e.target.value as RiskLevel)}
-                    className="w-full rounded border px-2 py-1"
-                  >
-                    <option value="LOW">LOW</option>
-                    <option value="MEDIUM">MEDIUM</option>
-                    <option value="HIGH">HIGH</option>
-                    <option value="EXTREME">EXTREME</option>
-                  </select>
-                </div>
-
-                <div className="space-y-1">
-                  <label className="text-sm font-medium">Min gas (gwei)</label>
-                  <input
-                    type="number"
-                    min={0}
-                    value={c.minGasPrice}
-                    onChange={(e) => updateConstraint(key, 'minGasPrice', Number(e.target.value))}
-                    className="w-full rounded border px-2 py-1"
-                  />
-                </div>
-
-                <div className="space-y-1">
-                  <label className="text-sm font-medium">Max gas (gwei)</label>
-                  <input
-                    type="number"
-                    min={0}
-                    value={c.maxGasPrice}
-                    onChange={(e) => updateConstraint(key, 'maxGasPrice', Number(e.target.value))}
-                    className="w-full rounded border px-2 py-1"
-                  />
-                </div>
+              <div>
+                <label className="block text-sm font-medium">Risk tolerance</label>
+                <select
+                  className="border rounded-lg px-3 py-2 w-full"
+                  value={a.riskTolerance}
+                  onChange={(e) => updateAgent(i, "riskTolerance", e.target.value as Risk)}
+                >
+                  <option value="LOW">LOW</option>
+                  <option value="MEDIUM">MEDIUM</option>
+                  <option value="HIGH">HIGH</option>
+                  <option value="EXTREME">EXTREME</option>
+                </select>
               </div>
-
-              <div className="space-y-1">
-                <label className="text-sm font-medium">Allowed chains</label>
-                <div className="flex flex-wrap gap-3">
-                  {CHAIN_OPTIONS.map((opt) => (
-                    <label key={opt.id} className="flex items-center gap-2 text-sm">
-                      <input
-                        type="checkbox"
-                        checked={c.allowedChains.includes(opt.id)}
-                        onChange={() =>
-                          updateConstraint(key, 'allowedChains', toggleArrayValue(c.allowedChains, opt.id))
-                        }
-                      />
-                      {opt.label}
-                    </label>
-                  ))}
-                </div>
+              <div>
+                <label className="block text-sm font-medium">Min gas (gwei)</label>
+                <input
+                  type="number"
+                  className="border rounded-lg px-3 py-2 w-full"
+                  value={a.minGasPrice}
+                  onChange={(e) => updateAgent(i, "minGasPrice", parseFloat(e.target.value || "0"))}
+                />
               </div>
-
-              <div className="space-y-1">
-                <label className="text-sm font-medium">Preferred protocols</label>
-                <div className="flex flex-wrap gap-3">
-                  {PROTOCOL_OPTIONS.map((p) => (
-                    <label key={p} className="flex items-center gap-2 text-sm">
-                      <input
-                        type="checkbox"
-                        checked={c.preferredProtocols.includes(p)}
-                        onChange={() =>
-                          updateConstraint(key, 'preferredProtocols', toggleArrayValue(c.preferredProtocols, p))
-                        }
-                      />
-                      {p}
-                    </label>
-                  ))}
-                </div>
+              <div>
+                <label className="block text-sm font-medium">Max gas (gwei)</label>
+                <input
+                  type="number"
+                  className="border rounded-lg px-3 py-2 w-full"
+                  value={a.maxGasPrice}
+                  onChange={(e) => updateAgent(i, "maxGasPrice", parseFloat(e.target.value || "0"))}
+                />
               </div>
             </div>
-          );
-        })}
+
+            <div className="mt-4">
+              <div className="text-sm font-medium mb-2">Allowed chains</div>
+              <div className="flex flex-wrap gap-4">
+                {(["ethereum", "base", "arbitrum"] as const).map((c) => (
+                  <label key={c} className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={a.allowedChains[c as keyof typeof a.allowedChains]}
+                      onChange={() => toggleNested(i, "allowedChains", c)}
+                    />
+                    <span className="text-sm capitalize">{c}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            <div className="mt-4">
+              <div className="text-sm font-medium mb-2">Preferred protocols</div>
+              <div className="flex flex-wrap gap-4">
+                {(["etherfi", "aave", "merkl", "morpho"] as const).map((p) => (
+                  <label key={p} className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={a.preferredProtocols[p as keyof typeof a.preferredProtocols]}
+                      onChange={() => toggleNested(i, "preferredProtocols", p)}
+                    />
+                    <span className="text-sm capitalize">{p}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          </div>
+        ))}
       </div>
 
-      {/* Results */}
-      {error && <div className="rounded-xl border border-red-300 bg-red-50 p-3 text-red-800">{error}</div>}
-      {result && (
-        <div className="rounded-xl border p-4">
-          <h2 className="mb-2 text-lg font-semibold">Final rankings</h2>
-          <div className="space-y-2">
-            {result.rankings.map((r, idx) => (
-              <div key={r.name + idx} className="flex items-center justify-between rounded border p-2">
-                <div className="flex items-center gap-2">
-                  <span>{r.emoji}</span>
-                  <span className="font-medium">{r.name}</span>
-                  <span className="text-sm text-gray-500">({r.currentStrategy})</span>
+      {/* Results summary (very light) */}
+      {result?.success && (
+        <div className="rounded-2xl border p-5 shadow-sm mt-8">
+          <h2 className="text-xl font-semibold mb-3">Final rankings</h2>
+          <ul className="space-y-2">
+            {result.rankings?.map((r: {
+              name: string;
+              currentStrategy: string;
+              currentAPY: number;
+              performance: { totalReturn: number };
+}) => (
+              <li key={r.name} className="flex items-center justify-between rounded-xl border p-3">
+                <div>
+                  <div className="font-medium">{r.name}</div>
+                  <div className="text-sm text-gray-600">
+                    {r.currentStrategy} • APY ~ {r.currentAPY.toFixed(2)}%
+                  </div>
                 </div>
-                <div className="text-sm">
-                  Return: <span className="font-semibold">{r.performance.totalReturn.toFixed(2)}%</span>
+                <div className="font-semibold">
+                  Return: {r.performance.totalReturn.toFixed(2)}%
                 </div>
-              </div>
+              </li>
             ))}
-          </div>
+          </ul>
         </div>
       )}
     </div>
